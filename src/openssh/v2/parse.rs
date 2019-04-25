@@ -20,188 +20,212 @@ impl FromStr for KeyType {
     }
 }
 
-struct KeyLinePartParser {
-    in_quotes: bool,
-    was_slash: bool,
-    separator: char,
+enum ParseError {
+    Unmatched(String),
+    Incomplete,
 }
 
-impl KeyLinePartParser {
-    pub fn new(separator: char) -> Self {
-        Self {
-            in_quotes: false,
-            was_slash: false,
-            separator,
+type ParseResult<'a, T> = Result<(T, &'a [char]), ParseError>;
+
+fn parse_key_type(input: &[char]) -> ParseResult<KeyType> {
+    match input.iter().position(|c| c == &' ') {
+        Some(index) => {
+            let remainder = &input[index..];
+            let type_str: String = input[..index].iter().collect();
+
+            let key_type = type_str.parse();
+
+            match key_type {
+                Ok(t) => Ok((t, remainder)),
+                Err(_) => Err(ParseError::Unmatched(format!(
+                    "Unknown key type '{}'.",
+                    type_str
+                ))),
+            }
+        }
+        None => Err(ParseError::Incomplete),
+    }
+}
+
+#[inline]
+fn parse_base64(input: &[char]) -> ParseResult<String> {
+    let str_end = match input
+        .iter()
+        .position(|c| !(c.is_ascii_alphanumeric() || c == &'/' || c == &'+'))
+    {
+        Some(mut index) => {
+            for _ in 0..2 {
+                if input.get(index + 1) == Some(&'=') {
+                    index += 1;
+                }
+            }
+            index
+        }
+        None => input.len(),
+    };
+
+    let remainder = &input[str_end..];
+
+    if let Some(c) = remainder.get(0) {
+        if !c.is_ascii_whitespace() {
+            return Err(ParseError::Unmatched(format!(
+                "Unexpected trailing character '{}' on base64 value.",
+                c
+            )));
         }
     }
 
-    pub fn still_part(&mut self, c: char) -> bool {
-        if c == '\\' {
-            // also handle double backslash
-            self.was_slash = !self.was_slash;
+    let base64_string: String = input[..str_end].iter().collect();
 
-            return true;
-        } else if c == '"' && !self.was_slash {
-            self.in_quotes = !self.in_quotes;
-        } else if c == self.separator && !self.in_quotes {
-            return false;
+    match base64_string.len() % 4 {
+        0 => Ok((base64_string, remainder)),
+        _ => Err(ParseError::Unmatched(
+            "Unexpected length of base64 value, expected a multiple of 4.".to_owned(),
+        )),
+    }
+}
+
+fn parse_encoded_key(input: &[char]) -> ParseResult<String> {
+    parse_base64(input)
+}
+
+fn skip_whitespace(input: &[char]) -> &[char] {
+    let skip_to = input
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .unwrap_or(0);
+
+    &input[skip_to..]
+}
+
+#[inline]
+fn skip_char(input: &[char]) -> &[char] {
+    if input.is_empty() {
+        input
+    } else {
+        &input[1..]
+    }
+}
+
+fn parse_public_key(input: &[char]) -> ParseResult<PublicKey> {
+    let (key_type, remainder) = parse_key_type(input)?;
+    let (encoded_key, remainder) = parse_encoded_key(skip_whitespace(remainder))?;
+
+    Ok((
+        PublicKey {
+            key_type,
+            encoded_key,
+        },
+        remainder,
+    ))
+}
+
+fn parse_option_name(input: &[char]) -> ParseResult<String> {
+    let name_end = input
+        .iter()
+        .position(|c| !c.is_ascii_alphanumeric() && c != &'-')
+        .unwrap_or_else(|| input.len());
+
+    Ok((input[..name_end].iter().collect(), &input[name_end..]))
+}
+
+fn parse_option_value(input: &[char]) -> ParseResult<String> {
+    if input.first() != Some(&'"') {
+        return Err(ParseError::Unmatched(
+            "Unexpected first character in option value.".to_owned(),
+        ));
+    }
+
+    let input = skip_char(input);
+    let mut last_char_slash = false;
+
+    for (ind, c) in input.iter().enumerate() {
+        if c == &'"' && !last_char_slash {
+            let val = input[..ind].iter().collect();
+            let remainder = skip_char(&input[ind..]);
+
+            return Ok((val, remainder));
         }
 
-        self.was_slash = false;
-        true
+        last_char_slash = !last_char_slash && c == &'\\';
     }
 
-    pub fn reset(&mut self) {
-        self.was_slash = false;
-        self.in_quotes = false;
+    Err(ParseError::Incomplete)
+}
+
+fn parse_options(input: &[char]) -> ParseResult<Vec<KeyOption>> {
+    let mut options: KeyOptions = KeyOptions::new();
+    let mut leftovers: &[char] = input;
+
+    while !leftovers.is_empty() {
+        let option_name = parse_option_name(leftovers);
+
+        if let Ok((name, remainder)) = option_name {
+            leftovers = remainder;
+            if leftovers.get(0) == Some(&'=') {
+                let (value, remainder) = parse_option_value(&leftovers[1..])?;
+                leftovers = remainder;
+
+                options.push((name, Some(value)));
+            } else {
+                options.push((name, None));
+            }
+
+            if leftovers.get(0) == Some(&',') {
+                leftovers = skip_char(leftovers);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
     }
+
+    Ok((options, leftovers))
+}
+
+fn parse_comments(input: &[char]) -> (String, &[char]) {
+    let mut comment_end = input
+        .iter()
+        .position(|c| c == &'\n')
+        .unwrap_or_else(|| input.len());
+
+    let remainder = &input[comment_end..];
+
+    // Windows CR-LF handling
+    if comment_end >= 2 && input.get(comment_end - 2) == Some(&'\r') {
+        comment_end -= 1;
+    }
+
+    let comment: String = input[..comment_end].iter().collect();
+
+    (comment, remainder)
 }
 
 impl KeyAuthorization {
-    fn parse_option_value(input: Option<String>) -> Option<String> {
-        if let Some(mut val) = input {
-            if let Some(to) = val.len().checked_sub(1) {
-                Some(val.drain(1..to).collect::<String>())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    fn parse_option(input: &str) -> KeyOption {
-        let mut part_parser = KeyLinePartParser::new('=');
-        let mut current_part: Vec<char> = Vec::with_capacity(32);
-        let mut option_name: Option<String> = None;
-        let mut option_raw_value: Option<String> = None;
-
-        let mut chars = input.chars().peekable();
-
-        while chars.peek().is_some() {
-            if let Some(c) = chars.next() {
-                if part_parser.still_part(c) {
-                    current_part.push(c);
-                } else {
-                    part_parser.reset();
-
-                    option_name = Some(current_part.drain(0..).collect());
-                    option_raw_value = Some(chars.collect());
-                    break;
-                }
-            }
-        }
-
-        if option_name.is_none() && !current_part.is_empty() {
-            option_name = Some(current_part.drain(0..).collect());
-        }
-
-        (
-            option_name.unwrap(),
-            Self::parse_option_value(option_raw_value),
-        )
-    }
-
-    fn parse_options(input: Option<String>) -> KeyOptions {
-        if let Some(options_str) = input {
-            let mut chars = options_str.chars().peekable();
-            let mut part_parser = KeyLinePartParser::new(',');
-            let mut current_part: Vec<char> = Vec::with_capacity(128);
-            let mut options = KeyOptions::default();
-
-            while chars.peek().is_some() {
-                if let Some(c) = chars.next() {
-                    if part_parser.still_part(c) {
-                        current_part.push(c);
-                    } else {
-                        part_parser.reset();
-
-                        options.push(Self::parse_option(
-                            &current_part.drain(0..).collect::<String>(),
-                        ));
-                    }
-                }
-            }
-
-            if !current_part.is_empty() {
-                options.push(Self::parse_option(
-                    &current_part.drain(0..).collect::<String>(),
-                ))
-            }
-
-            options
-        } else {
-            KeyOptions::default()
-        }
-    }
-
     fn parse(s: &str) -> Result<Self, String> {
-        let mut chars = s.chars().peekable();
-        let mut part_parser = KeyLinePartParser::new(' ');
-        let mut current_part: Vec<char> = Vec::with_capacity(1024);
-        let mut options: Option<String> = None;
-        let mut key_type: Option<KeyType> = None;
-        let mut encoded_key: Option<String> = None;
-        let mut comments = String::new();
-
-        while chars.peek().is_some() {
-            if encoded_key.is_some() {
-                comments = chars.collect::<String>().trim().to_owned();
-                break;
-
-            // always true
-            } else if let Some(c) = chars.next() {
-                // handle consecutive spaces
-                if c == ' ' && current_part.is_empty() {
-                    continue;
-                }
-
-                if key_type.is_some() {
-                    if part_parser.still_part(c) {
-                        current_part.push(c);
-                    } else {
-                        part_parser.reset();
-
-                        encoded_key = Some(current_part.drain(0..).collect());
-                    }
-                } else if part_parser.still_part(c) {
-                    current_part.push(c);
-                } else {
-                    part_parser.reset();
-
-                    let part = current_part.drain(0..).collect::<String>();
-
-                    match KeyType::from_str(&part) {
-                        Ok(t) => {
-                            key_type = Some(t);
-                        }
-                        Err(_) => {
-                            if options.is_some() {
-                                return Err(format!("{} is not a recognised key type", part));
-                            } else {
-                                options = Some(part);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // if EOI and no encoded key, use current part as encoded key
-        if encoded_key.is_none() && !current_part.is_empty() {
-            encoded_key = Some(current_part.drain(0..).collect());
-        }
-
-        match key_type {
-            Some(key_type) => match encoded_key {
-                Some(encoded_key) => Ok(Self {
-                    options: Self::parse_options(options),
-                    key: PublicKey::new(key_type, encoded_key),
+        let chars: Vec<char> = s.chars().collect();
+        let public_key_result = parse_public_key(chars.as_slice());
+        if let Ok((public_key, remainder)) = public_key_result {
+            let (comment, _remainder) = parse_comments(skip_whitespace(remainder));
+            Ok(Self {
+                options: vec![],
+                key: public_key,
+                comments: comment,
+            })
+        } else if let Ok((options, remainder)) = parse_options(chars.as_slice()) {
+            if let Ok((public_key, remainder)) = parse_public_key(skip_whitespace(remainder)) {
+                let (comments, _remainder) = parse_comments(skip_whitespace(remainder));
+                Ok(Self {
+                    options,
+                    key: public_key,
                     comments,
-                }),
-                _ => Err("could not parse encoded key".to_owned()),
-            },
-            _ => Err("could not parse key type".to_owned()),
+                })
+            } else {
+                Err("Could not find a valid public key after the options.".to_owned())
+            }
+        } else {
+            Err("Could not find a valid options string, or public key.".to_owned())
         }
     }
 }
@@ -339,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn it_parses_an_basic_keys_file() {
+    fn it_parses_a_basic_keys_file() {
         let file: &str = "ssh-ed25519 AAAAtHUM";
         let expected: Vec<KeysFileLine> = vec![KeysFileLine::Key(KeyAuthorization {
             options: KeyOptions::default(),
@@ -351,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn it_parses_an_basic_keys_file_with_two_comment_lines() {
+    fn it_parses_a_basic_keys_file_with_two_comment_lines() {
         let file: &str = "# hello, world!\n\nssh-ed25519 AAAAtHUM";
         let expected: Vec<KeysFileLine> = vec![
             KeysFileLine::Comment("# hello, world!".to_owned()),
